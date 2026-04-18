@@ -101,4 +101,14 @@ struct CombineAggrFun {
 	static AggregateFunction GetFunction();
 };
 
+struct BlackholeFun {
+	static constexpr const char *Name = "blackhole";
+	static constexpr const char *Parameters = "arg";
+	static constexpr const char *Description = "A do-nothing aggregate that forces its arguments to be evaluated (defeating metadata-only shortcuts like count(*) over parquet) and always returns BIGINT 0. Intended for benchmarking. Called without arguments it is a non-optimizable alternative to count(*).";
+	static constexpr const char *Example = "blackhole(a, b, c)";
+	static constexpr const char *Categories = "";
+
+	static AggregateFunctionSet GetFunctions();
+};
+
 } // namespace duckdb

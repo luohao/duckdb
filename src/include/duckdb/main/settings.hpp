@@ -1368,6 +1368,17 @@ struct PreferRangeJoinsSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct ForceKWayMergeJoinSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "force_kway_merge_join";
+	static constexpr const char *Description =
+	    "Collapse a chain of FULL OUTER JOINs on the same equality key into a single k-way merge join operator";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct PreserveIdentifierCaseSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "preserve_identifier_case";

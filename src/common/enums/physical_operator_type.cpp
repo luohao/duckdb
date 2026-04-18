@@ -67,6 +67,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "IE_JOIN";
 	case PhysicalOperatorType::ASOF_JOIN:
 		return "ASOF_JOIN";
+	case PhysicalOperatorType::KWAY_MERGE_JOIN:
+		return "KWAY_MERGE_JOIN";
 	case PhysicalOperatorType::CROSS_PRODUCT:
 		return "CROSS_PRODUCT";
 	case PhysicalOperatorType::POSITIONAL_JOIN:

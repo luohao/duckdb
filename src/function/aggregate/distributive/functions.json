@@ -55,5 +55,12 @@
         "description": "Combines exported aggregate states",
         "example": "combine_aggr(state_column)",
         "type": "aggregate_function"
+    },
+    {
+        "name": "blackhole",
+        "parameters": "arg",
+        "description": "A do-nothing aggregate that forces its arguments to be evaluated (defeating metadata-only shortcuts like count(*) over parquet) and always returns BIGINT 0. Intended for benchmarking. Called without arguments it is a non-optimizable alternative to count(*).",
+        "example": "blackhole(a, b, c)",
+        "type": "aggregate_function_set"
     }
 ]

@@ -3,6 +3,7 @@
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
+#include "duckdb/execution/operator/join/physical_kway_merge_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -18,9 +19,71 @@ static void RewriteJoinCondition(unique_ptr<Expression> &root_expr, idx_t offset
 	    root_expr, [&](BoundReferenceExpression &ref, unique_ptr<Expression> &expr) { ref.index += offset; });
 }
 
+//! Returns true if `op` looks like a FULL OUTER JOIN chain node on a single
+//! equality condition — i.e., the kind of node we want to collapse into a
+//! k-way merge join when ForceKWayMergeJoinSetting is true.
+static bool IsFOJChainNode(const LogicalComparisonJoin &op) {
+	if (op.join_type != JoinType::OUTER) {
+		return false;
+	}
+	if (op.conditions.size() != 1) {
+		return false;
+	}
+	if (!op.conditions[0].IsComparison() || op.conditions[0].GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		return false;
+	}
+	return true;
+}
+
+//! Flatten a chain of FOJ nodes into leaves (left-to-right). If `op` is a
+//! FOJ chain root, this moves out all its descendant children, leaving the
+//! logical tree under `op` in a partially-emptied state (safe: we will not
+//! use it again).
+static void FlattenFOJChain(LogicalComparisonJoin &op, vector<unique_ptr<LogicalOperator>> &leaves) {
+	// LHS: if it's also a chain node, recurse; otherwise it's a leaf
+	auto &lhs = *op.children[0];
+	if (lhs.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    IsFOJChainNode(lhs.Cast<LogicalComparisonJoin>())) {
+		FlattenFOJChain(lhs.Cast<LogicalComparisonJoin>(), leaves);
+	} else {
+		leaves.push_back(std::move(op.children[0]));
+	}
+	// RHS is always a leaf of this binary join
+	leaves.push_back(std::move(op.children[1]));
+}
+
 PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoin &op) {
 	// now visit the children
 	D_ASSERT(op.children.size() == 2);
+
+	// K-WAY MERGE JOIN intercept: if the setting is on and this op looks like
+	// a FULL OUTER JOIN chain, collapse it into a single PhysicalKWayMergeJoin.
+	// We only do this at the *top* of the chain — if the parent is also a chain
+	// node, it will call this and handle us via FlattenFOJChain.
+	if (Settings::Get<ForceKWayMergeJoinSetting>(context) && IsFOJChainNode(op)) {
+		vector<unique_ptr<LogicalOperator>> leaves;
+		FlattenFOJChain(op, leaves);
+		if (leaves.size() >= 2) {
+			// Plan each leaf as its own physical subtree. Leaves themselves
+			// are NOT FOJ chain nodes (FlattenFOJChain unwraps all of them),
+			// so this recursion bottoms out cleanly.
+			vector<reference<PhysicalOperator>> child_ops;
+			child_ops.reserve(leaves.size());
+			for (auto &leaf : leaves) {
+				child_ops.push_back(CreatePlan(*leaf));
+			}
+			// For USING(k)-style joins, the key column sits at index 0 of
+			// each child's schema (that's how the binder materializes USING).
+			// TODO: derive key_col_idx from op.conditions for the general case.
+			idx_t key_col_idx = 0;
+			auto &kway = Make<PhysicalKWayMergeJoin>(op.types, key_col_idx, op.estimated_cardinality);
+			for (auto &c : child_ops) {
+				kway.children.push_back(c);
+			}
+			return kway;
+		}
+	}
+
 	idx_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
 	idx_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 	auto &left = CreatePlan(*op.children[0]);
