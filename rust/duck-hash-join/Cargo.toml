@@ -1,0 +1,28 @@
+[package]
+name = "duck-hash-join"
+version = "0.0.1"
+edition = "2021"
+description = "Port of DuckDB's parallel hash join to Rust over Arrow. Input: parquet; output: Arrow RecordBatches."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "inner_join_bench"
+path = "src/bin/inner_join_bench.rs"
+
+[[bin]]
+name = "chain_bench"
+path = "src/bin/chain_bench.rs"
+
+[dependencies]
+parquet = { version = "57.3", default-features = false, features = ["arrow", "zstd", "snap"] }
+arrow = { version = "57.3", default-features = false }
+rayon = "1.11"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
