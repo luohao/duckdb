@@ -215,10 +215,38 @@ chain_bench both benefit equally from the cache.
 
 Host: Apple M2 Max (8 cores: 4P+4E), macOS 26.4.
 
+## Bench data: where it lives and how to make it
+
+- **Files live** in `$DIR/k{K}_o{OVERLAP*100}/` — per-config subdirs with
+  `t0.parquet`..`t{K-1}.parquet` (inputs) + `joined.parquet` (pre-materialized
+  FOJ output used as the `scan_joined` baseline). At `rows=1000000, k=5,
+  overlap=0.5` each table is ~67 MB on disk (11 cols incl. 2 strings) and
+  `joined.parquet` is ~332 MB.
+- **Regenerate with** [`scripts/gen_bench_data.sh`](scripts/gen_bench_data.sh).
+  It builds `kway_bench` if needed, then writes the full `{k=2,5,6} × {0.0,
+  0.5, 1.0}` matrix by default. Override via `DIR=`, `KS=`, `OVERLAPS=`,
+  `ROWS=`, `THREADS=`, `REPEATS=` env vars. Example:
+  ```bash
+  DIR=/tmp/my_bench KS=5 OVERLAPS=0.5 rust/duck-hash-join/scripts/gen_bench_data.sh
+  ```
+- **Why kway_bench doubles as the generator:** the DuckDB-side bench in
+  [`tools/utils/kway_bench.cpp`](../../tools/utils/kway_bench.cpp) emits the
+  parquet files as a side effect of timing its own `scan_joined`,
+  `hash_join`, and `kway_op` variants. Using the same tool for both sides
+  guarantees byte-identical inputs — no generation drift between the DuckDB
+  and Rust measurements.
+- **Key distribution** (kway_bench.cpp:173-217): seeded-random shuffled
+  keyspace (`setseed(0.42)`), then each table gets `shared + unique` keys
+  where `shared = rows * overlap` is the same across all tables and
+  `unique = rows - shared` is per-table disjoint. Each table sorted by `k`
+  before writing.
+
 ## Quick commands
 
 ```bash
 # 1. Generate parquet data (one-time)
+rust/duck-hash-join/scripts/gen_bench_data.sh
+# or, equivalent manual:
 ./build/tools/kway_bench --rows 1000000 --ks "5" --overlaps "0.5" \
     --repeats 3 --threads 4 --dir /tmp/kway_4t --keep
 
