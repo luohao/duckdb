@@ -14,5 +14,6 @@ pub mod hash;
 pub mod ht;
 pub mod ht_entry;
 pub mod io;
+pub mod pipeline;
 pub mod radix;
 pub mod row;

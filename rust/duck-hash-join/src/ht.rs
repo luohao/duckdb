@@ -37,6 +37,11 @@ fn directory_capacity(n_rows: usize) -> usize {
     target.next_power_of_two()
 }
 
+/// Public alias of `directory_capacity` for use by `pipeline.rs`.
+pub fn directory_capacity_for(n_rows: usize) -> usize {
+    directory_capacity(n_rows)
+}
+
 /// Hash-table directory + row arena. Build in three steps:
 /// 1. `reserve(n)` to pre-size the arena.
 /// 2. Append rows + their key hashes via `insert_rows`.

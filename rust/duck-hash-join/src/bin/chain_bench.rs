@@ -19,7 +19,7 @@ use std::time::Instant;
 use duck_hash_join::ht::JoinHashTable;
 use duck_hash_join::io::{
     bench_layout, keys_only_layout, read_parquet_into_ht_parallel, read_parquet_lance_parallel,
-    read_parquet_keys_into_ht_parallel, TableData,
+    read_parquet_lance_serial, read_parquet_keys_into_ht_parallel, TableData,
 };
 use duck_hash_join::row::PhysType;
 
@@ -56,6 +56,9 @@ fn main() {
     let sink_checksum = env::args().any(|a| a == "--sink-checksum");
     let pipelined = env::args().any(|a| a == "--pipelined");
     let lance = env::args().any(|a| a == "--lance");
+    let streaming = env::args().any(|a| a == "--streaming");
+    let operator = env::args().any(|a| a == "--operator");
+    let scan_lance = env::args().any(|a| a == "--scan-lance");
 
     let dir = PathBuf::from(dir);
     if let Some(t) = threads {
@@ -89,6 +92,21 @@ fn main() {
 
     if lance {
         run_chain_lance(&dir, k, repeats);
+        return;
+    }
+
+    if streaming {
+        run_chain_streaming(&dir, k, repeats);
+        return;
+    }
+
+    if operator {
+        run_chain_operator(&dir, k, repeats);
+        return;
+    }
+
+    if scan_lance {
+        run_scan_lance(&dir, repeats);
         return;
     }
 
@@ -1054,4 +1072,375 @@ impl<'a> BatchStringView<'a> {
                 .unwrap(),
         }
     }
+}
+
+// ============================================================================
+// Streaming variant: parquet reads run on dedicated worker threads and the
+// main thread pulls each TableData lazily as the chain needs it. Reads and
+// chain steps overlap in wall time — chain_step_i only blocks on tables[i]
+// being ready, not on all 5 reads completing.
+//
+// Each reader is `read_parquet_lance_serial` (no internal rayon) so readers
+// don't fight the rayon pool the chain's probes use. OS schedules 5 reader
+// threads across the remaining cores while rayon handles probe work.
+// ============================================================================
+
+fn run_chain_streaming(dir: &std::path::Path, k: usize, repeats: usize) {
+    use std::sync::mpsc;
+    use std::thread;
+
+    assert!(k <= 5, "ChainRow hardcodes 5 slots");
+    let paths: Vec<PathBuf> = (0..k).map(|i| dir.join(format!("t{}.parquet", i))).collect();
+    for p in &paths {
+        if !p.exists() {
+            panic!("missing {:?}", p);
+        }
+    }
+
+    let mut read_wait_ms = Vec::new();
+    let mut chain_ms = Vec::new();
+    let mut sink_ms = Vec::new();
+    let mut total_ms = Vec::new();
+    let mut last_rows_out = 0usize;
+    let mut checksum_accum: u64 = 0;
+
+    for rep in 0..=repeats {
+        // --- Spawn k reader threads BEFORE starting the timer. ---
+        // We want reads to genuinely overlap with chain work, so kicking them
+        // off is part of what we're measuring. But the mpsc channel setup +
+        // thread spawn themselves aren't part of the "join time" DuckDB pays,
+        // so start the clock after spawn.
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..k)
+            .map(|_| mpsc::sync_channel::<TableData>(1))
+            .unzip();
+
+        let mut handles = Vec::with_capacity(k);
+        for (i, path) in paths.iter().enumerate() {
+            let path = path.clone();
+            let tx = senders[i].clone();
+            handles.push(thread::spawn(move || {
+                let data = read_parquet_lance_serial(&path).unwrap();
+                let _ = tx.send(data);
+            }));
+        }
+        drop(senders);
+
+        let t_start = Instant::now();
+
+        // --- Wait for t0 — need it before we can init the chain. ---
+        let t0_data = receivers[0].recv().unwrap();
+        let t0_recv = Instant::now();
+        let mut tables: Vec<TableData> = Vec::with_capacity(k);
+        tables.push(t0_data);
+
+        // Init chain from t0.
+        let t0 = &tables[0];
+        let n0 = t0.ht.n_rows();
+        let t0_arena = t0.ht.arena_base_addr();
+        let t0_row_size = t0.ht.layout().row_size();
+        let t0_key_off = t0.ht.key_offset();
+        let t0_hashes_addr = t0.ht.hashes_base_addr_const() as usize;
+
+        let mut chain: Vec<ChainRow> = Vec::with_capacity(n0 * 4);
+        chain.resize(n0, ChainRow::default());
+        let chain_addr = chain.as_mut_ptr() as usize;
+        (0..n0).into_par_iter_fill(move |i| unsafe {
+            let row_ptr_i = (t0_arena + i * t0_row_size) as *const u8;
+            let key = std::ptr::read_unaligned(row_ptr_i.add(t0_key_off) as *const i32);
+            let h = *((t0_hashes_addr as *const u64).add(i));
+            let dst = (chain_addr as *mut ChainRow).add(i);
+            std::ptr::write(
+                dst,
+                ChainRow {
+                    key,
+                    _pad: 0,
+                    hash: h,
+                    ptrs: [row_ptr_i as u64, 0, 0, 0, 0],
+                },
+            );
+        });
+
+        // --- Stream tables 1..k as they arrive, run chain steps. ---
+        for i in 1..k {
+            let t_i = receivers[i].recv().unwrap();
+            tables.push(t_i);
+            chain_step(&mut chain, &tables[i].ht, i);
+        }
+        let t_chain_done = Instant::now();
+        let rows_out = chain.len();
+        last_rows_out = rows_out;
+
+        // --- Sink ---
+        let checksum = lance_sink(&tables, &chain);
+        let checksum = std::hint::black_box(checksum);
+        checksum_accum = checksum_accum.wrapping_add(checksum);
+        let t_end = Instant::now();
+
+        // Drain any reader threads still running (shouldn't be any — chain
+        // depends on all of them — but just in case).
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let wait = t0_recv.duration_since(t_start).as_secs_f64() * 1000.0;
+        let chain_time = t_chain_done.duration_since(t0_recv).as_secs_f64() * 1000.0;
+        let sink = t_end.duration_since(t_chain_done).as_secs_f64() * 1000.0;
+        let total = t_end.duration_since(t_start).as_secs_f64() * 1000.0;
+
+        if rep == 0 {
+            println!(
+                "[warmup] t0_wait={:.1} chain(overlapped-w-reads)={:.1} sink={:.1} total={:.1} rows_out={}",
+                wait, chain_time, sink, total, rows_out
+            );
+            continue;
+        }
+        read_wait_ms.push(wait);
+        chain_ms.push(chain_time);
+        sink_ms.push(sink);
+        total_ms.push(total);
+        println!(
+            "[rep {}]  t0_wait={:.1} chain={:.1} sink={:.1} total={:.1} rows_out={}",
+            rep, wait, chain_time, sink, total, rows_out
+        );
+    }
+
+    println!();
+    println!("[median over {} reps — streaming pipelined FOJ chain]", repeats);
+    println!("  wait-for-t0            : {:>7.1} ms", median(&mut read_wait_ms));
+    println!("  chain + remaining reads: {:>7.1} ms (overlapped)", median(&mut chain_ms));
+    println!("  sink (Arrow gather)    : {:>7.1} ms", median(&mut sink_ms));
+    println!("  total                  : {:>7.1} ms", median(&mut total_ms));
+    println!("  rows_out               : {}", last_rows_out);
+    println!("  checksum               : 0x{:016x}", checksum_accum);
+}
+
+// ============================================================================
+// Operator-framework FOJ chain — DuckDB-style pipelines with Global/Local
+// state split.
+// ============================================================================
+
+fn run_chain_operator(dir: &std::path::Path, k: usize, repeats: usize) {
+    use duck_hash_join::io::read_parquet_lance_parallel;
+    use duck_hash_join::pipeline::*;
+    use std::sync::Arc;
+
+    assert!(k <= 5, "Batch ptrs are [u64; 5]");
+    let paths: Vec<PathBuf> = (0..k).map(|i| dir.join(format!("t{}.parquet", i))).collect();
+    for p in &paths {
+        if !p.exists() {
+            panic!("missing {:?}", p);
+        }
+    }
+
+    let mut total_ms = Vec::new();
+    let mut read_ms = Vec::new();
+    let mut chain_ms = Vec::new();
+    let mut sink_ms = Vec::new();
+    let mut last_rows_out = 0usize;
+    let mut checksum_accum: u64 = 0;
+
+    let num_threads = rayon::current_num_threads();
+
+    for rep in 0..=repeats {
+        let t_start = Instant::now();
+
+        // Phase 1 — parallel parquet read (Arc<TableData> per file).
+        let tables: Vec<Arc<duck_hash_join::io::TableData>> = paths
+            .iter()
+            .map(|p| Arc::new(read_parquet_lance_parallel(p).unwrap()))
+            .collect();
+        let t_read = Instant::now();
+
+        // Phase 2 — DuckDB-style pipeline orchestration for a left-deep FOJ
+        // chain. We have (k-1) HashJoinOps. Each one is a MetaPipeline whose
+        // build sink is fed by TWO sub-pipelines:
+        //   1. ScanT_i → ProbeHJ_{i-1} → HJ_i.build_sink  (streaming matches
+        //                                                  + probe-unmatched)
+        //   2. UnmatchedHJ_{i-1}       → HJ_i.build_sink  (FOJ build-unmatched)
+        //
+        // The final stage's sink is the ChecksumSinkOp.
+        //
+        // Dependency: sub-pipeline (2) for HJ_i can't run until HJ_{i-1} has
+        // been through its probe phase (when its matched bitmap is populated).
+        // HJ_i.finalize() runs after BOTH sub-pipelines have fed it.
+
+        let hjs: Vec<HashJoinOp> = (0..(k - 1))
+            .map(|i| {
+                let est_rows = tables.iter().map(|t| t.n_rows()).sum::<usize>();
+                HashJoinOp::new(est_rows, i)
+            })
+            .collect();
+
+        // Pipeline 0: scan t0 → HJ0.build_sink. One sub-pipeline only.
+        {
+            let scan = ParquetScanSource::new(tables[0].clone(), 0);
+            drive_source_to_sink(&scan, &hjs[0], num_threads);
+            hjs[0].finalize(hjs[0].global_state());
+        }
+
+        // Pipelines 1..k-2: each FOJ step has build_sink fed by (a) probe
+        // stream + (b) unmatched source from prior HJ. Finalize after both.
+        for i in 1..(k - 1) {
+            // Sub-pipeline 1: ScanT_i → ProbeHJ_{i-1} → HJ_i.build_sink
+            {
+                let scan = ParquetScanSource::new(tables[i].clone(), i);
+                let probe = ProbeOperator::new(&hjs[i - 1]);
+                drive_source_op_sink(&scan, &probe, &hjs[i], num_threads);
+            }
+            // Sub-pipeline 2: UnmatchedHJ_{i-1} → HJ_i.build_sink
+            {
+                let unmatched = UnmatchedSource::new(&hjs[i - 1]);
+                drive_source_to_sink(&unmatched, &hjs[i], num_threads);
+            }
+            hjs[i].finalize(hjs[i].global_state());
+        }
+
+        let t_chain = Instant::now();
+
+        // Final pipeline (k-1): ScanT_{k-1} → ProbeHJ_{k-2} → ChecksumSink
+        //                      + UnmatchedHJ_{k-2} → ChecksumSink
+        let sink = ChecksumSinkOp::new(tables.clone());
+        {
+            let scan = ParquetScanSource::new(tables[k - 1].clone(), k - 1);
+            let probe = ProbeOperator::new(&hjs[k - 2]);
+            drive_source_op_sink(&scan, &probe, &sink, num_threads);
+        }
+        {
+            let unmatched = UnmatchedSource::new(&hjs[k - 2]);
+            drive_source_to_sink(&unmatched, &sink, num_threads);
+        }
+        sink.finalize(sink.global_state());
+        let (checksum, rows) = sink.finish();
+        let t_end = Instant::now();
+
+        let read = t_read.duration_since(t_start).as_secs_f64() * 1000.0;
+        let chain = t_chain.duration_since(t_read).as_secs_f64() * 1000.0;
+        let s = t_end.duration_since(t_chain).as_secs_f64() * 1000.0;
+        let total = t_end.duration_since(t_start).as_secs_f64() * 1000.0;
+
+        if rep == 0 {
+            println!(
+                "[warmup] read={:.1} chain={:.1} sink={:.1} total={:.1} rows_out={} checksum=0x{:x}",
+                read, chain, s, total, rows, checksum
+            );
+            continue;
+        }
+        read_ms.push(read);
+        chain_ms.push(chain);
+        sink_ms.push(s);
+        total_ms.push(total);
+        last_rows_out = rows;
+        checksum_accum = checksum_accum.wrapping_add(checksum);
+        println!(
+            "[rep {}]  read={:.1} chain={:.1} sink={:.1} total={:.1} rows={} cksum=0x{:x}",
+            rep, read, chain, s, total, rows, checksum
+        );
+    }
+
+    println!();
+    println!("[median over {} reps — operator framework FOJ chain (WIP)]", repeats);
+    println!("  parquet read (all k)   : {:>7.1} ms", median(&mut read_ms));
+    println!("  chain (pipelines)      : {:>7.1} ms", median(&mut chain_ms));
+    println!("  sink (checksum)        : {:>7.1} ms", median(&mut sink_ms));
+    println!("  total                  : {:>7.1} ms", median(&mut total_ms));
+    println!("  rows_out               : {}", last_rows_out);
+    println!("  checksum               : 0x{:016x}", checksum_accum);
+}
+
+// ============================================================================
+// scan_denorm baseline (11 columns via Lance-style loader + ChecksumSinkOp).
+// Meant to be apples-to-apples with DuckDB's kway_bench scan_joined variant:
+// read joined.parquet, blackhole over every column.
+// ============================================================================
+
+fn run_scan_lance(dir: &std::path::Path, repeats: usize) {
+    use duck_hash_join::io::{read_parquet_lance_parallel};
+    use duck_hash_join::pipeline::{BatchCols, ChecksumSinkOp, Sink};
+    use std::sync::Arc;
+
+    let path = dir.join("joined.parquet");
+    if !path.exists() {
+        panic!("missing {:?}", path);
+    }
+
+    let mut read_ms = Vec::new();
+    let mut scan_ms = Vec::new();
+    let mut total_ms = Vec::new();
+    let mut last_rows = 0usize;
+    let mut checksum_accum: u64 = 0;
+
+    for rep in 0..=repeats {
+        let t_start = Instant::now();
+
+        // Load joined.parquet with full 11-column schema retained.
+        let table = Arc::new(read_parquet_lance_parallel(&path).unwrap());
+        let t_read = Instant::now();
+
+        // Iterate all batches, read every data column via cached Arrow
+        // buffer pointers — equivalent work to DuckDB's blackhole sink.
+        //
+        // Reads c_int, c_bigint, c_dbl, c_flt, c_bool, c_short, c_long via
+        // ChecksumSinkOp::sink on synthesized batches of row-ptrs into
+        // `table`'s arena. Same hot loop the FOJ chain uses at output time,
+        // so the baseline measures the same work the chain's sink does.
+        let sink = ChecksumSinkOp::new(vec![table.clone()]);
+        use duck_hash_join::pipeline::Batch;
+        let arena_base = table.ht.arena_base_addr();
+        let row_size = table.ht.layout().row_size();
+        let n = table.n_rows();
+        last_rows = n;
+
+        // Feed in batches of 16384 rows; each row-ptr goes into ptrs[0],
+        // leaving other slots zero (sink will fold sentinel bytes for them).
+        // That adds some extra work but also matches the join sink's cost.
+        const CHUNK: usize = 16_384;
+        use rayon::prelude::*;
+        let results: Vec<(u64, usize)> = (0..n)
+            .step_by(CHUNK)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|start| {
+                let end = (start + CHUNK).min(n);
+                let mut batch = Batch::with_capacity(end - start);
+                for i in start..end {
+                    let ptr = (arena_base + i * row_size) as u64;
+                    batch.push(0, 0, [ptr, 0, 0, 0, 0]);
+                }
+                let mut local = duck_hash_join::pipeline::ChecksumLocal::default();
+                sink.sink(batch, sink.global_state(), &mut local);
+                (local.checksum, local.rows)
+            })
+            .collect();
+        let checksum: u64 = results.iter().map(|(c, _)| c).copied().sum();
+        let checksum = std::hint::black_box(checksum);
+        checksum_accum = checksum_accum.wrapping_add(checksum);
+        let t_end = Instant::now();
+
+        let read = t_read.duration_since(t_start).as_secs_f64() * 1000.0;
+        let scan = t_end.duration_since(t_read).as_secs_f64() * 1000.0;
+        let total = t_end.duration_since(t_start).as_secs_f64() * 1000.0;
+
+        if rep == 0 {
+            println!(
+                "[warmup] read={:.1} scan={:.1} total={:.1} rows={} cksum=0x{:x}",
+                read, scan, total, n, checksum
+            );
+            continue;
+        }
+        read_ms.push(read);
+        scan_ms.push(scan);
+        total_ms.push(total);
+        println!(
+            "[rep {}]  read={:.1} scan={:.1} total={:.1} rows={} cksum=0x{:x}",
+            rep, read, scan, total, n, checksum
+        );
+    }
+
+    println!();
+    println!("[median over {} reps — scan_denorm (11 cols incl strings)]", repeats);
+    println!("  parquet read           : {:>7.1} ms", median(&mut read_ms));
+    println!("  scan (cksum all cols)  : {:>7.1} ms", median(&mut scan_ms));
+    println!("  total                  : {:>7.1} ms", median(&mut total_ms));
+    println!("  rows                   : {}", last_rows);
+    println!("  checksum               : 0x{:016x}", checksum_accum);
 }

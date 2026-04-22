@@ -509,6 +509,87 @@ impl TableData {
     }
 }
 
+/// Serial single-thread parquet ingest into `TableData`. Meant to be run on
+/// its own worker thread for k-way streaming pipelines: k readers running
+/// concurrently each use one thread, leaving the rayon pool free for the
+/// chain's probe work.
+///
+/// Internally reads row groups sequentially, so one call takes longer wall
+/// time than `read_parquet_lance_parallel` in isolation — but running k
+/// copies on k threads avoids contending for the global rayon pool with the
+/// chain's probe, which is the actual goal.
+pub fn read_parquet_lance_serial(path: &Path) -> parquet::errors::Result<TableData> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    // --- Metadata ---
+    let meta_file = File::open(path).map_err(|e| {
+        parquet::errors::ParquetError::General(format!("open {:?}: {}", path, e))
+    })?;
+    let meta_reader = SerializedFileReader::new(meta_file)?;
+    let meta = meta_reader.metadata();
+    let num_row_groups = meta.num_row_groups();
+
+    // --- Serial per-row-group read, full schema retained ---
+    let mut batches: Vec<Arc<RecordBatch>> = Vec::with_capacity(num_row_groups);
+    let mut boundaries: Vec<u32> = vec![0];
+    for rg_idx in 0..num_row_groups {
+        let file = File::open(path).map_err(|e| {
+            parquet::errors::ParquetError::General(format!("open rg{}: {}", rg_idx, e))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            file,
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new(),
+        )?
+        .with_row_groups(vec![rg_idx])
+        .with_batch_size(1_000_000);
+        let reader = builder.build()?;
+        for b in reader {
+            let b = Arc::new(b?);
+            let nr = b.num_rows() as u32;
+            boundaries.push(*boundaries.last().unwrap() + nr);
+            batches.push(b);
+        }
+    }
+    let total_rows = *boundaries.last().unwrap() as usize;
+
+    // --- Populate slim HT arena serially ---
+    // We purposely do NOT use rayon here; the caller is already running k of
+    // these on k threads, and nested rayon would collapse back to a shared
+    // pool that contends with downstream chain probe work.
+    let mut ht = JoinHashTable::new(keys_only_layout());
+    ht.set_len(total_rows);
+    let layout = ht.layout().clone();
+    let key_off = layout.column_offset(0);
+    let row_size = layout.row_size();
+    let arena_addr = ht.arena_base_addr();
+    let hashes_addr = ht.hashes_base_addr();
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let start = boundaries[batch_idx] as usize;
+        let k_col = batch.column_by_name("k").expect("missing k column");
+        let arr = k_col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("k is not Int32");
+        let vals = arr.values();
+        let hashes_ptr = hashes_addr as *mut u64;
+        for (i, &v) in vals.iter().enumerate() {
+            let idx = start + i;
+            unsafe {
+                let row_ptr = (arena_addr + idx * row_size) as *mut u8;
+                std::ptr::write_unaligned(row_ptr.add(key_off) as *mut i32, v);
+                *hashes_ptr.add(idx) = crate::hash::murmur_hash32(v as u32);
+            }
+        }
+    }
+
+    Ok(TableData {
+        ht,
+        batches,
+        boundaries,
+    })
+}
+
 /// Parallel parquet ingest with Arrow retention. Reads each row group on a
 /// rayon task, returning the RecordBatches intact. The HT arena is slim
 /// (key + header only), populated per batch in parallel.
